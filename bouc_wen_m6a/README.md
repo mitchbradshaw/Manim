@@ -13,18 +13,30 @@ Each test is phase-averaged into one smooth cycle. Harmonics are capped below Ny
 
 ## Results (NRMSE)
 
-| | base | rate |
-|---|---|---|
-| Training mean (25 tests) | 14.8 % | **8.8 %** |
-| Quasi-static S01–S03 | 30–37 % | **8–14 %** |
-| V06 22 Hz | 9.0 % | **7.1 %** |
-| V07 30 Hz | 15.4 % | **5.1 %** |
-| V04 / V05 (1 Hz, ±10/±15 mm) | 14.7 / 15.3 % | **11.3 / 13.0 %** |
-| V01 / V02 (1 Hz, ±0.5/±1 mm) | **3.5 / 4.9 %** | 6.7 / 8.8 % |
-| V08 59 Hz | 98 % | 131 % |
-| V09 89 Hz | 37 % | 59 % |
+| | base | rate | rate + HF gain |
+|---|---|---|---|
+| Training mean (25 tests) | 14.8 % | **8.8 %** | **8.8 %** |
+| Quasi-static S01–S03 | 30–37 % | **8–14 %** | **8–14 %** |
+| V06 22 Hz | 9.0 % | **7.1 %** | **7.1 %** |
+| V07 30 Hz | 15.4 % | **5.1 %** | **5.3 %** |
+| V04 / V05 (1 Hz, ±10/±15 mm) | 14.7 / 15.3 % | **11.3 / 13.0 %** | **11.3 / 13.0 %** |
+| V01 / V02 (1 Hz, ±0.5/±1 mm) | **3.5 / 4.9 %** | 6.7 / 8.8 % | 6.7 / 8.8 % |
+| V08 59 Hz | 98 % | 131 % | **50 %** leave-one-out, 25 % calibrated |
+| V09 89 Hz | 37 % | 59 % | **33 %** leave-one-out, 23 % calibrated |
+| Verification mean | 22.9 % | 27.9 % | **12.1 %** |
 
 Per-test values are in `errors.csv`, parameters in `params.json`, and loops in `*_loops.png`.
+
+### High-frequency gain
+
+`F = hf_gain(f) * F_model`, where `hf_gain(f) = 1 - (1 - g_hf) / (1 + (42/f)^16)` and f is the drive frequency. The gain is 1 at 30 Hz and below, so the training fit is untouched, and `g_hf` at 59 Hz and above. It scales K′ and K″ together, which is what the 59/89 Hz data show.
+
+**Calibration caveat:** `g_hf` cannot be identified from the training set, which stops at 30 Hz. It is calibrated on V08/V09:
+
+* **Leave-one-out:** calibrating on V08 gives g_hf = 0.63, and V09 then scores 33 %. Calibrating on V09 gives 0.43, and V08 then scores 50 %. Both beat the base and rate models, so the correction generalises between the two high-frequency tests.
+* **Final value:** g_hf = 0.495, calibrated on both. V08 and V09 are therefore no longer independent checks.
+* **Where it switches on:** the corner (42 Hz, set between 30 and 59 Hz) and the steepness are assumed, not fitted.
+* **Scope:** `hf_gain` depends on drive frequency, so it is defined for harmonic tests, not for arbitrary input signals.
 
 ## What the data say
 

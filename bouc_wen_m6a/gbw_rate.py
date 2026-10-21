@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import pandas as pd
 from numba import njit
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize_scalar
 
 NPTS, NHARM, NCYC = 256, 30, 4
 NAMES = ['ka', 'k2', 'k3', 'kt', 'xt', 'pt', 'kh', 'zu', 'n', 'w', 'r2', 'kr', 'zru', 'tau', 'c', 'm']
@@ -31,6 +31,7 @@ LO = [0, -0.05, -0.01, 0, -5, 1.2, 0, 0.02, 0.3, 0, -0.9, 0, 0.02, 0.01, 0, -5]
 HI = [0.5, 0.05, 0.01, 0.05, 12, 4, 1, 5, 4, 1, 0.9, 1, 5, 100, 0.01, 5]
 P0 = [0.05, -0.003, 1e-4, 0.0024, 0.06, 2, 0.3, 0.42, 0.8, 0.5, 0, 0.1, 0.5, 1, 0, 0.5]
 RATE_ONLY = ['kr', 'zru', 'tau', 'c', 'm']
+F_C, P_HF = 42.0, 16  # high-frequency gain switches on between 30 Hz (no drop) and 59 Hz (drop)
 
 
 def load_cycle(csv, f_approx):
@@ -106,13 +107,22 @@ def simulate(x, v, a, dt, p, ncyc):
     return out
 
 
-def predict(cyc, p):
+def hf_gain(f, g_hf):
+    """Dynamic gain vs drive frequency: 1 up to ~30 Hz, g_hf above ~59 Hz (scales K' and K'' together)."""
+    return 1.0 - (1.0 - g_hf) / (1.0 + (F_C / f) ** P_HF)
+
+
+def predict(cyc, p, g_hf=1.0):
     Fm = simulate(cyc['x'], cyc['v'], cyc['a'], 1.0 / (cyc['f'] * NPTS), np.asarray(p, float), NCYC)
-    return Fm - (Fm.max() + Fm.min()) / 2
+    return (Fm - (Fm.max() + Fm.min()) / 2) * hf_gain(cyc['f'], g_hf)
 
 
-def nrmse(cyc, p):
-    return np.sqrt(np.mean((predict(cyc, p) - cyc['F']) ** 2)) / np.sqrt(np.mean(cyc['F'] ** 2))
+def nrmse(cyc, p, g_hf=1.0):
+    return np.sqrt(np.mean((predict(cyc, p, g_hf) - cyc['F']) ** 2)) / np.sqrt(np.mean(cyc['F'] ** 2))
+
+
+def fit_hf_gain(cycles, p):
+    return minimize_scalar(lambda g: sum(nrmse(c, p, g) ** 2 for c in cycles), bounds=(0.05, 1.5), method='bounded').x
 
 
 def fit(cycles, free, p0, starts=4, seed=0):
@@ -150,32 +160,46 @@ def main(tr_dir, ve_dir, out):
         sets[name] = [(r.test, r.f_test_Hz, load_cycle(f'{d}/{r.test}_centred.csv', r.f_approx_Hz)) for _, r in s.iterrows()]
     train = [c for _, _, c in sets['training']]
 
-    base0 = list(P0)
-    for k in RATE_ONLY:
-        base0[NAMES.index(k)] = 0.0
-    print('fitting base (rate-independent) model')
-    p_base = fit(train, [k for k in NAMES if k not in RATE_ONLY], base0)
-    print('fitting rate model')
-    seed_rate = list(p_base)
-    for k in RATE_ONLY:
-        seed_rate[NAMES.index(k)] = P0[NAMES.index(k)]
-    p_rate = fit(train, NAMES, seed_rate)
-    json.dump({'base': dict(zip(NAMES, p_base)), 'rate': dict(zip(NAMES, p_rate))}, open(f'{out}/params.json', 'w'), indent=2)
+    if os.path.exists(f'{out}/params.json'):  # reuse a previous training fit
+        P = json.load(open(f'{out}/params.json'))
+        p_base, p_rate = [P['base'][k] for k in NAMES], [P['rate'][k] for k in NAMES]
+    else:
+        base0 = list(P0)
+        for k in RATE_ONLY:
+            base0[NAMES.index(k)] = 0.0
+        print('fitting base (rate-independent) model')
+        p_base = fit(train, [k for k in NAMES if k not in RATE_ONLY], base0)
+        print('fitting rate model')
+        seed_rate = list(p_base)
+        for k in RATE_ONLY:
+            seed_rate[NAMES.index(k)] = P0[NAMES.index(k)]
+        p_rate = fit(train, NAMES, seed_rate)
+
+    # The training set stops at 30 Hz, so g_hf can only come from the high-frequency tests.
+    # Leave-one-out: calibrate on one of V08/V09, score on the other; then calibrate on both.
+    hf = {t: c for t, f, c in sets['verification'] if f > F_C}
+    g_loo = {t: fit_hf_gain([c for u, c in hf.items() if u != t], p_rate) for t in hf}
+    g_hf = fit_hf_gain(list(hf.values()), p_rate)
+    print('g_hf leave-one-out:', {t: round(g, 3) for t, g in g_loo.items()}, ' g_hf (both):', round(g_hf, 3))
+    json.dump({'base': dict(zip(NAMES, p_base)), 'rate': dict(zip(NAMES, p_rate)),
+               'hf_gain': dict(g_hf=g_hf, f_c=F_C, p=P_HF, g_hf_leave_one_out=g_loo)}, open(f'{out}/params.json', 'w'), indent=2)
 
     rows = []
     for name, tests in sets.items():
         for test, fnom, c in tests:
             rows.append(dict(set=name, test=test, f_Hz=fnom, X_mm=np.ptp(c['x']) / 2,
-                             nrmse_base=nrmse(c, p_base), nrmse_rate=nrmse(c, p_rate)))
+                             nrmse_base=nrmse(c, p_base), nrmse_rate=nrmse(c, p_rate),
+                             nrmse_rate_hf_loo=nrmse(c, p_rate, g_loo[test]) if test in hf else np.nan,
+                             nrmse_rate_hf=nrmse(c, p_rate, g_hf)))
     T = pd.DataFrame(rows)
     T.to_csv(f'{out}/errors.csv', index=False, float_format='%.4f')
     print('fundamental complex stiffness K\' + iK\'\' (kN/mm), verification:')
     for test, fnom, c in sets['verification']:
         e = np.exp(-2j * np.pi * np.arange(NPTS) / NPTS)
         k = lambda F: np.dot(F, e) / np.dot(c['x'], e)
-        print(f'  {test} {fnom:5g} Hz  meas {k(c["F"]):.3f}  base {k(predict(c, p_base)):.3f}  rate {k(predict(c, p_rate)):.3f}')
+        print(f'  {test} {fnom:5g} Hz  meas {k(c["F"]):.3f}  base {k(predict(c, p_base)):.3f}  rate+hf {k(predict(c, p_rate, g_hf)):.3f}')
     print(T.round(3).to_string(index=False))
-    print(T.groupby('set')[['nrmse_base', 'nrmse_rate']].mean().round(3))
+    print(T.groupby('set')[['nrmse_base', 'nrmse_rate', 'nrmse_rate_hf']].mean().round(3))
 
     for name, tests in sets.items():
         ncol = 5
@@ -184,10 +208,11 @@ def main(tr_dir, ve_dir, out):
         for ax, (test, fnom, c) in zip(axs.flat, tests):
             ax.plot(c['x_raw'], c['F_raw'], color='#1f3a5f', lw=0.6, alpha=0.5, label='Measured')
             xx = np.r_[c['x'], c['x'][:1]]
-            for p, col, ls, lab in ((p_base, '0.55', '--', 'Rate-indep. GBW+T (refit)'), (p_rate, '#c0504d', '-', 'Rate-dependent GBW+T')):
-                ff = predict(c, p)
+            for p, g, col, ls, lab in ((p_base, 1.0, '0.55', '--', 'Rate-indep. GBW+T (refit)'),
+                                       (p_rate, g_hf, '#c0504d', '-', 'Rate-dependent GBW+T + HF gain')):
+                ff = predict(c, p, g)
                 ax.plot(xx, np.r_[ff, ff[:1]], color=col, ls=ls, lw=1.4, label=lab)
-            e0, e1 = nrmse(c, p_base), nrmse(c, p_rate)
+            e0, e1 = nrmse(c, p_base), nrmse(c, p_rate, g_hf)
             ax.set_title(f'{test[4:]}  {fnom:g} Hz  ±{np.ptp(c["x"]) / 2:.2f} mm\nNRMSE {e0:.1%} → {e1:.1%}', fontsize=9)
             ax.grid(alpha=0.3)
         for ax in axs.flat[len(tests):]:
