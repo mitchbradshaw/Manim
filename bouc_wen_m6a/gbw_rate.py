@@ -49,7 +49,8 @@ def load_cycle(csv, f_approx):
         amp = [abs(np.dot(xc, np.exp(-2j * np.pi * fi * t))) for fi in fg]
         f = fg[int(np.argmax(amp))]
     th = (f * t) % 1.0
-    h = np.arange(1, NHARM + 1)
+    nh = int(min(NHARM, 0.45 / (np.median(np.diff(t)) * f)))  # no harmonics above Nyquist (59/89 Hz tests)
+    h = np.arange(1, nh + 1)
     A = np.hstack([np.ones((len(th), 1)), np.cos(2 * np.pi * np.outer(th, h)), np.sin(2 * np.pi * np.outer(th, h))])
     reg = 1e-6 * np.eye(A.shape[1])
     cx = np.linalg.solve(A.T @ A + reg, A.T @ x)
@@ -57,11 +58,11 @@ def load_cycle(csv, f_approx):
     g = np.arange(NPTS) / NPTS
     w = 2 * np.pi * f
     C, S = np.cos(2 * np.pi * np.outer(g, h)), np.sin(2 * np.pi * np.outer(g, h))
-    a, b = cx[1:NHARM + 1], cx[NHARM + 1:]
+    a, b = cx[1:nh + 1], cx[nh + 1:]
     xg = cx[0] + C @ a + S @ b
     vg = w * (-S @ (a * h) + C @ (b * h))
     ag = -w * w * (C @ (a * h * h) + S @ (b * h * h))
-    Fg = cf[0] + C @ cf[1:NHARM + 1] + S @ cf[NHARM + 1:]
+    Fg = cf[0] + C @ cf[1:nh + 1] + S @ cf[nh + 1:]
     xg -= (xg.max() + xg.min()) / 2
     Fg -= (Fg.max() + Fg.min()) / 2
     return dict(f=f, x=xg, v=vg, a=ag, F=Fg, t_raw=t, x_raw=x, F_raw=F)
@@ -114,7 +115,7 @@ def nrmse(cyc, p):
     return np.sqrt(np.mean((predict(cyc, p) - cyc['F']) ** 2)) / np.sqrt(np.mean(cyc['F'] ** 2))
 
 
-def fit(cycles, free, p0, starts=6, seed=0):
+def fit(cycles, free, p0, starts=4, seed=0):
     idx = [NAMES.index(k) for k in free]
     lo, hi = np.array(LO)[idx], np.array(HI)[idx]
 
@@ -168,6 +169,11 @@ def main(tr_dir, ve_dir, out):
                              nrmse_base=nrmse(c, p_base), nrmse_rate=nrmse(c, p_rate)))
     T = pd.DataFrame(rows)
     T.to_csv(f'{out}/errors.csv', index=False, float_format='%.4f')
+    print('fundamental complex stiffness K\' + iK\'\' (kN/mm), verification:')
+    for test, fnom, c in sets['verification']:
+        e = np.exp(-2j * np.pi * np.arange(NPTS) / NPTS)
+        k = lambda F: np.dot(F, e) / np.dot(c['x'], e)
+        print(f'  {test} {fnom:5g} Hz  meas {k(c["F"]):.3f}  base {k(predict(c, p_base)):.3f}  rate {k(predict(c, p_rate)):.3f}')
     print(T.round(3).to_string(index=False))
     print(T.groupby('set')[['nrmse_base', 'nrmse_rate']].mean().round(3))
 
